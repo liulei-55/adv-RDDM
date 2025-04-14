@@ -454,7 +454,8 @@ class UnetRes(nn.Module):
         input_condition=False,
         objective='pred_res_noise',
         test_res_or_noise="res_noise",
-        img_to_img_translation=False
+        img_to_img_translation=False,
+        adversarial_mode=False  # New parameter for adversarial generation
     ):
         super().__init__()
         self.condition = condition
@@ -468,6 +469,7 @@ class UnetRes(nn.Module):
         self.objective = objective
         self.test_res_or_noise = test_res_or_noise
         self.img_to_img_translation = img_to_img_translation
+        self.adversarial_mode = adversarial_mode
         # determine dimensions
         if self.num_unet == 2:
             self.unet0 = Unet(dim,
@@ -1251,9 +1253,8 @@ class ResidualDiffusion(nn.Module):
 
         return self.p_losses(img, t, *args, **kwargs)
 
+
 # trainer class
-
-
 class Trainer(object):
     def __init__(
         self,
