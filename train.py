@@ -4,186 +4,156 @@ import torch
 import torchvision.models as models
 import torchvision.transforms as transforms
 from PIL import Image
-from torch.utils.data import DataLoader
-from torchvision.datasets import ImageFolder
+from torch.utils.data import DataLoader, Dataset
+import glob
+from pathlib import Path
 from src.residual_denoising_diffusion_pytorch import (
     Trainer, UnetRes, set_seed
 )
 from src.adversarial_diffusion import AdversarialResidualDiffusion
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32'
+
+# 主函数开始前添加
+torch.cuda.empty_cache()
 
 
-class TargetClassifier(torch.nn.Module):
-    def __init__(self, num_classes=2):
-        super().__init__()
-        self.model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+class TargetedAttackDataset(Dataset):
+    def __init__(self, source_dir, target_dir, transform=None):
+        self.source_dir = source_dir
+        self.target_dir = target_dir
+        self.transform = transform
 
-        # 冻结基础特征提取层
-        for param in self.model.parameters():
-            param.requires_grad = False
+        self.source_images = sorted(glob.glob(os.path.join(source_dir, '*.*')))
+        self.target_images = sorted(glob.glob(os.path.join(target_dir, '*.*')))
 
-        # 替换分类层
-        num_features = self.model.fc.in_features
-        self.model.fc = torch.nn.Linear(num_features, num_classes)
+        assert len(self.source_images) > 0, f"No source images found in {source_dir}"
+        assert len(self.target_images) > 0, f"No target images found in {target_dir}"
 
-        # 只训练分类层
-        for param in self.model.fc.parameters():
-            param.requires_grad = True
+        print(f"Found {len(self.source_images)} source images and {len(self.target_images)} target images")
 
-    def forward(self, x):
-        return self.model(x)
+    def __len__(self):
+        return len(self.source_images)
 
+    def __getitem__(self, idx):
+        source_path = self.source_images[idx]
+        source_img = Image.open(source_path).convert('RGB')
 
-def train_classifier(model, train_loader, val_loader=None, num_epochs=10):
-    """训练分类器"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        target_idx = idx % len(self.target_images)
+        target_path = self.target_images[target_idx]
+        target_img = Image.open(target_path).convert('RGB')
 
-    best_acc = 0.0
-    for epoch in range(num_epochs):
-        # 训练阶段
-        model.train()
-        running_loss = 0.0
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
+        if self.transform:
+            source_img = self.transform(source_img)
+            target_img = self.transform(target_img)
 
-            if batch_idx % 100 == 0:
-                print(f'Epoch: {epoch + 1}/{num_epochs}, Batch: {batch_idx}, Loss: {loss.item():.4f}')
-
-        # 验证阶段
-        if val_loader is not None:
-            model.eval()
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for data, target in val_loader:
-                    data, target = data.to(device), target.to(device)
-                    output = model(data)
-                    _, predicted = output.max(1)
-                    total += target.size(0)
-                    correct += predicted.eq(target).sum().item()
-
-            acc = 100. * correct / total
-            print(f'Validation Accuracy: {acc:.2f}%')
-
-            # 保存最佳模型
-            if acc > best_acc:
-                best_acc = acc
-                torch.save(model.state_dict(), './pre-model/resnet18_cat_dog_best.pth')
-
-        print(f'Epoch {epoch + 1} average loss: {running_loss / len(train_loader):.4f}')
-
-    # 保存最终模型
-    torch.save(model.state_dict(), './pre-model/resnet18_cat_dog_final.pth')
-    return model
+        return source_img, target_img
 
 
-def prepare_data(data_dir, batch_size=32):
-    """准备数据加载器"""
+def custom_collate(batch):
+    source_imgs = []
+    target_imgs = []
+
+    for source_img, target_img in batch:
+        source_imgs.append(source_img)
+        target_imgs.append(target_img)
+
+    # 使用torch.stack，但不设置out参数
+    source_imgs = torch.stack(source_imgs)
+    target_imgs = torch.stack(target_imgs)
+
+    return source_imgs, target_imgs
+
+def prepare_targeted_attack_data(source_dir, target_dir, batch_size=4):
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize(144),  # 稍大的尺寸
+        transforms.RandomCrop(128),  # 随机裁剪
+        transforms.RandomHorizontalFlip(),  # 随机水平翻转
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),  # 颜色抖动
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+                           std=[0.229, 0.224, 0.225])
     ])
 
-    dataset = ImageFolder(data_dir, transform=transform)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    dataset = TargetedAttackDataset(
+        source_dir=source_dir,
+        target_dir=target_dir,
+        transform=transform
+    )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
-    return train_loader, val_loader
-
-
-def train_classifier_main():
-    """训练分类器的主函数"""
-    # 确保模型保存目录存在
-    os.makedirs('./pre-model', exist_ok=True)
-
-    # 准备数据
-    data_dir = "./database/cat_dog"  # 包含cat和dog两个子文件夹的目录
-    train_loader, val_loader = prepare_data(data_dir)
-
-    # 创建并训练分类器
-    classifier = TargetClassifier(num_classes=2)
-    train_classifier(classifier, train_loader, val_loader, num_epochs=10)
-
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
 
 def main():
-    """对抗样本生成的主函数"""
-    # 基础环境设置
-    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(e) for e in [0])
-    os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-    sys.stdout.flush()
-    set_seed(10)
+    # 确保分类器在正确的设备上
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 加载训练好的分类器
-    target_classifier = TargetClassifier(num_classes=2)
-    target_classifier.load_state_dict(torch.load('./pre-model/resnet18_cat_dog_best.pth'))
-    target_classifier = target_classifier.cuda()
-    target_classifier.eval()
+    # 配置参数
+    config = {
+        'train': {
+            'source': "./database/train/source_images",
+            'target': "./database/train/target_images"
+        },
+        'test': {
+            'source': "./database/test/source_images",
+            'target': "./database/test/target_images"
+        },
+        'batch_size': 2
+    }
 
-    # 调试模式配置
-    debug = True
-    if debug:
-        save_and_sample_every = 2
-        sampling_timesteps = 10
-        train_num_steps = 200
-    else:
-        save_and_sample_every = 1000
-        sampling_timesteps = int(sys.argv[1]) if len(sys.argv) > 1 else 10
-        train_num_steps = 100000
+    # 创建必要的目录
+    for paths in config.values():
+        if isinstance(paths, dict):
+            for path in paths.values():
+                os.makedirs(path, exist_ok=True)
+
+    # 加载预训练的ResNet18
+    classifier = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1).cuda()
+    classifier = classifier.to(device)
+    classifier.eval()
 
     # 模型配置
-    condition = True
-    input_condition = False
-    input_condition_mask = False
-
-    # 数据路径配置
-    folder = [
-        "./database/cat_dog/cat.flist",
-        "./database/cat_dog/dog.flist",
-        "./database/cat_dog/dog_test.flist"
-    ]
-
-    # 模型参数设置
     model_config = {
-        'image_size': 64,
+        'image_size': 128,
         'num_unet': 2,
-        'train_batch_size': 16,
-        'num_samples': 16,
-        'sum_scale': 1,
+        'train_batch_size': 4,
+        'num_samples': 4,
+        'sum_scale': 0.5,
         'objective': 'pred_res_noise',
         'test_res_or_noise': "res_noise",
-        'epsilon_vis': 1e-3,
+        'epsilon_vis': 0.01,
         'attack_config': {
-            'target_class': 1,  # 狗的类别标签
-            'attack_loss_weight': 1.0,
-            'classifier': target_classifier
+            'use_target_image': True,
+            'attack_loss_weight': 0.1,
+            'classifier': classifier
         }
     }
 
-    # 初始化UnetRes模型
+    # 准备数据加载器
+    train_loader = prepare_targeted_attack_data(
+        source_dir='./database/train/source_images',
+        target_dir='./database/train/target_images',
+        batch_size=model_config['train_batch_size']
+    )
+
+    # 初始化模型
     model = UnetRes(
-        dim=64,
+        dim=128,
         dim_mults=(1, 2, 4, 8),
+        channels=3,
         num_unet=model_config['num_unet'],
-        condition=condition,
-        input_condition=input_condition,
+        condition=True,
+        input_condition=False,
         objective=model_config['objective'],
         test_res_or_noise=model_config['test_res_or_noise'],
         img_to_img_translation=True,
-        adversarial_mode=True
+        adversarial_mode=True,
+        resnet_block_groups=8,  # 增加ResNet块的组数
     )
 
     # 初始化对抗残差扩散模型
@@ -191,61 +161,49 @@ def main():
         model,
         image_size=model_config['image_size'],
         timesteps=1000,
-        sampling_timesteps=sampling_timesteps,
+        sampling_timesteps=10,
         objective=model_config['objective'],
         loss_type='l2',
-        condition=condition,
+        condition=True,
         sum_scale=model_config['sum_scale'],
-        input_condition=input_condition,
-        input_condition_mask=input_condition_mask,
+        input_condition=False,
+        input_condition_mask=False,
         test_res_or_noise=model_config['test_res_or_noise'],
         img_to_img_translation=True,
         epsilon_vis=model_config['epsilon_vis'],
-        target_class=model_config['attack_config']['target_class'],
         classifier=model_config['attack_config']['classifier'],
         attack_loss_weight=model_config['attack_config']['attack_loss_weight']
     )
 
+    # 确保所有参数都需要梯度
+    for param in model.parameters():
+        param.requires_grad = True
+
+    # 确保所有参数都需要梯度
+    for param in diffusion.parameters():
+        param.requires_grad = True
+
     # 初始化训练器
     trainer = Trainer(
-        diffusion,
-        folder,
+        diffusion_model=diffusion,
+        train_dataloader=train_loader,
         train_batch_size=model_config['train_batch_size'],
-        num_samples=model_config['num_samples'],
-        train_lr=2e-4,
-        train_num_steps=train_num_steps,
+        train_lr=1e-4,
+        train_num_steps=2000,
         gradient_accumulate_every=2,
-        ema_decay=0.995,
-        amp=False,
-        convert_image_to="RGB",
-        condition=condition,
-        save_and_sample_every=save_and_sample_every,
-        equalizeHist=False,
-        crop_patch=False,
-        generation=True,
+        ema_decay=0.999,  # 提高EMA衰减率
+        amp=True,
+        results_folder='./results/sample',
+        save_and_sample_every=200,
+        condition=True,
         num_unet=model_config['num_unet']
     )
 
-    # 训练对抗模型
+    # 开始训练
     trainer.train()
-
-    # 测试对抗样本生成
-    if trainer.accelerator.is_local_main_process:
-        trainer.load(trainer.train_num_steps // save_and_sample_every)
-        results_folder = f'./results/adv_test_resnet18_{sampling_timesteps}'
-        trainer.set_results_folder(results_folder)
-        trainer.test(last=True)
 
 
 if __name__ == '__main__':
-    # 设置多进程启动方式
     torch.multiprocessing.freeze_support()
     torch.multiprocessing.set_start_method('spawn', force=True)
-
-    # 如果需要训练分类器
-    if not os.path.exists('./pre-model/resnet18_cat_dog_best.pth'):
-        print("Training classifier first...")
-        train_classifier_main()
-
-    # 运行对抗样本生成
     main()

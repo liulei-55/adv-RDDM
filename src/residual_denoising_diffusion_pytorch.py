@@ -649,6 +649,10 @@ class ResidualDiffusion(nn.Module):
         self.test_res_or_noise = test_res_or_noise
         self.img_to_img_translation = img_to_img_translation
 
+        # 确保所有参数都可以计算梯度
+        for param in self.parameters():
+            param.requires_grad = True
+
         if self.condition:
             self.sum_scale = sum_scale if sum_scale else 0.01
             ddim_sampling_eta = 0.
@@ -1142,96 +1146,109 @@ class ResidualDiffusion(nn.Module):
             raise ValueError(f'invalid loss type {self.loss_type}')
 
     def p_losses(self, imgs, t, noise=None):
-        if isinstance(imgs, list):  # Condition
-            if self.input_condition:
-                x_input_condition = imgs[2]
-            else:
-                x_input_condition = 0
-            x_input = imgs[1]
-            x_start = imgs[0]  # gt = imgs[0], input = imgs[1]
-        else:  # Generation
-            x_input = 0
-            x_start = imgs
+        """
+        处理损失计算
+        imgs: 如果是条件生成，应该是包含[source_img, target_img]的列表
+        """
+        if isinstance(imgs, (list, tuple)):
+            if len(imgs) != 2:
+                raise ValueError("Expected [source_img, target_img] for conditional generation")
+            source_img, target_img = imgs
 
+            # 确保输入张量需要梯度
+            source_img.requires_grad_(True)
+            target_img.requires_grad_(True)
+
+            x_start = target_img  # 目标图像作为起点
+            x_input = source_img  # 源图像作为输入
+            x_input_condition = None  # 额外的条件输入（如果需要）
+        else:
+            # 无条件生成的情况
+            x_start = imgs
+            x_input = torch.zeros_like(x_start)
+            x_input_condition = None
+
+        # 生成噪声
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # 计算残差
         x_res = x_input - x_start
 
+        # 获取形状信息
         b, c, h, w = x_start.shape
 
-        # noise sample
+        # 采样噪声图像
         x = self.q_sample(x_start, x_res, t, noise=noise)
 
-        # if doing self-conditioning, 50% of the time, predict x_start from current set of times
-        # and condition with unet with that
-        # this technique will slow down training by 25%, but seems to lower FID significantly
+        # 自条件处理（如果启用）
         x_self_cond = None
         if self.self_condition and random.random() < 0.5:
             with torch.no_grad():
                 x_self_cond = self.model_predictions(
-                    x_input, x, t, x_input_condition if self.input_condition else 0).pred_x_start
+                    x_input, x, t,
+                    x_input_condition if self.input_condition else 0
+                ).pred_x_start
                 x_self_cond.detach_()
 
-        # predict and take gradient step
+        # 准备模型输入
         if not self.condition:
             x_in = x
         else:
             if self.img_to_img_translation:
-                if self.input_condition:
+                if self.input_condition and x_input_condition is not None:
                     x_in = torch.cat((x, x_input_condition), dim=1)
                 else:
                     x_in = x
             else:
-                if self.input_condition:
+                if self.input_condition and x_input_condition is not None:
                     x_in = torch.cat((x, x_input, x_input_condition), dim=1)
                 else:
                     x_in = torch.cat((x, x_input), dim=1)
 
-        model_out = self.model(x_in,
-                               [self.alphas_cumsum[t]*self.num_timesteps,
-                                   self.betas_cumsum[t]*self.num_timesteps],
-                               x_self_cond)
+        # 获取模型输出
+        model_out = self.model(
+            x_in,
+            [self.alphas_cumsum[t] * self.num_timesteps,
+             self.betas_cumsum[t] * self.num_timesteps],
+            x_self_cond
+        )
 
+        # 准备目标和计算损失
         target = []
         if self.objective == 'pred_res_noise':
-            target.append(x_res)
-            target.append(noise)
+            target.extend([x_res, noise])
+            pred_res, pred_noise = model_out[0], model_out[1]
 
-            pred_res = model_out[0]
-            pred_noise = model_out[1]
         elif self.objective == 'pred_x0_noise':
-            target.append(x_start)
-            target.append(noise)
-
-            pred_res = x_input-model_out[0]
+            target.extend([x_start, noise])
+            pred_res = x_input - model_out[0]
             pred_noise = model_out[1]
+
         elif self.objective == "pred_noise":
             target.append(noise)
-
             pred_noise = model_out[0]
 
         elif self.objective == "pred_res":
             target.append(x_res)
-
             pred_res = model_out[0]
 
         elif self.objective == "pred_x0":
             target.append(x_start)
-
             pred_x0 = model_out[0]
 
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
-        u_loss = False
-        if u_loss:
+        # 计算损失
+        if hasattr(self, 'u_loss') and self.u_loss:
             x_u = self.q_posterior_from_res_noise(pred_res, pred_noise, x, t)
             u_gt = self.q_posterior_from_res_noise(x_res, noise, x, t)
-            loss = 10000*self.loss_fn(x_u, u_gt, reduction='none')
+            loss = 10000 * self.loss_fn(x_u, u_gt, reduction='none')
             return [loss]
         else:
             loss_list = []
-            for i in range(len(model_out)):
-                loss = self.loss_fn(model_out[i], target[i], reduction='none')
+            for pred, tgt in zip(model_out, target):
+                loss = self.loss_fn(pred, tgt, reduction='none')
                 loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
                 loss_list.append(loss)
             return loss_list
@@ -1257,400 +1274,278 @@ class ResidualDiffusion(nn.Module):
 # trainer class
 class Trainer(object):
     def __init__(
-        self,
-        diffusion_model,
-        folder,
-        *,
-        train_batch_size=16,
-        gradient_accumulate_every=1,
-        augment_flip=True,
-        train_lr=1e-4,
-        train_num_steps=100000,
-        ema_update_every=10,
-        ema_decay=0.995,
-        adam_betas=(0.9, 0.99),
-        save_and_sample_every=1000,
-        num_samples=25,
-        results_folder='./results/sample',
-        amp=False,
-        fp16=False,
-        split_batches=True,
-        convert_image_to=None,
-        condition=False,
-        sub_dir=False,
-        equalizeHist=False,
-        crop_patch=False,
-        generation=False,
-        num_unet=2
+            self,
+            diffusion_model,
+            train_dataloader,
+            test_dataloader=None,  # 新增测试数据加载器参数
+            *,
+            train_batch_size=16,
+            gradient_accumulate_every=1,
+            train_lr=1e-4,
+            train_num_steps=100000,
+            ema_update_every=10,
+            ema_decay=0.995,
+            save_and_sample_every=1000,
+            num_samples=25,
+            results_folder='./results/sample',
+            amp=False,
+            fp16=False,
+            split_batches=True,
+            condition=False,
+            sub_dir=False,
+            crop_patch=False,
+            num_unet=2
     ):
         super().__init__()
 
+        # 基础设置
         self.accelerator = Accelerator(
             split_batches=split_batches,
             mixed_precision='fp16' if fp16 else 'no'
         )
-        self.sub_dir = sub_dir
-        self.crop_patch = crop_patch
-
         self.accelerator.native_amp = amp
+        self.device = self.accelerator.device
 
+        # 模型相关
         self.model = diffusion_model
-
-        assert has_int_squareroot(
-            num_samples), 'number of samples must have an integer square root'
-        self.num_samples = num_samples
-        self.save_and_sample_every = save_and_sample_every
-
-        self.batch_size = train_batch_size
-        self.gradient_accumulate_every = gradient_accumulate_every
-
-        self.train_num_steps = train_num_steps
         self.image_size = diffusion_model.image_size
         self.condition = condition
         self.num_unet = num_unet
 
-        if self.condition:
-            if len(folder) == 3:
-                self.condition_type = 1
-                # test_input
-                ds = dataset(folder[-1], self.image_size,
-                             augment_flip=False, convert_image_to=convert_image_to, condition=0, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
-                trian_folder = folder[0:2]
+        # 训练相关
+        assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
+        self.num_samples = num_samples
+        self.save_and_sample_every = save_and_sample_every
+        self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        self.train_num_steps = train_num_steps
+        # 保存原始数据加载器
+        self.train_dataloader = train_dataloader
 
-                self.sample_dataset = ds
-                self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
-                                                                               pin_memory=True, num_workers=4)))  # cpu_count()
+        # 准备数据加载器
+        self.dl = cycle(self.accelerator.prepare(train_dataloader))
+        self.test_loader = cycle(self.accelerator.prepare(test_dataloader)) if test_dataloader else None
 
-                ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
-                             convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
-                self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
-                                shuffle=True, pin_memory=True, num_workers=4)))
-            elif len(folder) == 4:
-                self.condition_type = 2
-                # test_gt+test_input
-                ds = dataset(folder[2:4], self.image_size,
-                             augment_flip=False, convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
-                trian_folder = folder[0:2]
+        # 其他设置
+        self.sub_dir = sub_dir
+        self.crop_patch = crop_patch
+        self.step = 0
 
-                self.sample_dataset = ds
-                self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
-                                                                               pin_memory=True, num_workers=4)))  # cpu_count()
-
-                ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
-                             convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
-                self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
-                                shuffle=True, pin_memory=True, num_workers=4)))
-            elif len(folder) == 6:
-                self.condition_type = 3
-                # test_gt+test_input
-                ds = dataset(folder[3:6], self.image_size,
-                             augment_flip=False, convert_image_to=convert_image_to, condition=2, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
-                trian_folder = folder[0:3]
-
-                self.sample_dataset = ds
-                self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
-                                                                               pin_memory=True, num_workers=4)))  # cpu_count()
-
-                ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
-                             convert_image_to=convert_image_to, condition=2, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
-                self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
-                                shuffle=True, pin_memory=True, num_workers=4)))
-        else:
-            self.condition_type = 0
-            trian_folder = folder
-
-            ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
-                         convert_image_to=convert_image_to, condition=0, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
-            self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
-                            shuffle=True, pin_memory=True, num_workers=4)))
-
-        # optimizer
-
-        # self.opt = Adam(diffusion_model.parameters(),
-        #                 lr=train_lr, betas=adam_betas)
+        # 优化器设置
         if self.num_unet == 1:
             self.opt0 = RAdam(diffusion_model.parameters(),
                               lr=train_lr, weight_decay=0.0)
+            self.model, self.opt0 = self.accelerator.prepare(self.model, self.opt0)
         elif self.num_unet == 2:
             self.opt0 = RAdam(
                 diffusion_model.model.unet0.parameters(), lr=train_lr, weight_decay=0.0)
             self.opt1 = RAdam(
                 diffusion_model.model.unet1.parameters(), lr=train_lr, weight_decay=0.0)
-
-        # for logging results in a folder periodically
-
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta=ema_decay,
-                           update_every=ema_update_every)
-
-            self.set_results_folder(results_folder)
-
-        # step counter state
-
-        self.step = 0
-
-        # prepare model, dataloader, optimizer with accelerator
-        if self.num_unet == 1:
-            self.model, self.opt = self.accelerator.prepare(
-                self.model, self.opt0)
-        elif self.num_unet == 2:
             self.model, self.opt0, self.opt1 = self.accelerator.prepare(
                 self.model, self.opt0, self.opt1)
-        device = self.accelerator.device
-        self.device = device
+
+        # EMA设置
+        if self.accelerator.is_main_process:
+            self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
+            self.set_results_folder(results_folder)
 
     def save(self, milestone):
+        """保存模型和训练状态"""
         if not self.accelerator.is_local_main_process:
             return
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
+        }
+
         if self.num_unet == 1:
-            data = {
-                'step': self.step,
-                'model': self.accelerator.get_state_dict(self.model),
+            data['opt0'] = self.opt0.state_dict()
+        else:
+            data.update({
                 'opt0': self.opt0.state_dict(),
-                'ema': self.ema.state_dict(),
-                'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
-            }
-        elif self.num_unet == 2:
-            data = {
-                'step': self.step,
-                'model': self.accelerator.get_state_dict(self.model),
-                'opt0': self.opt0.state_dict(),
-                'opt1': self.opt1.state_dict(),
-                'ema': self.ema.state_dict(),
-                'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
-            }
+                'opt1': self.opt1.state_dict()
+            })
+
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
+        """加载模型和训练状态"""
         path = Path(self.results_folder / f'model-{milestone}.pt')
+        if not path.exists():
+            return
 
-        if path.exists():
-            data = torch.load(
-                str(path), map_location=self.device)
+        data = torch.load(str(path), map_location=self.device)
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
 
-            model = self.accelerator.unwrap_model(self.model)
-            model.load_state_dict(data['model'])
+        self.step = data['step']
+        if self.num_unet == 1:
+            self.opt0.load_state_dict(data['opt0'])
+        else:
+            self.opt0.load_state_dict(data['opt0'])
+            self.opt1.load_state_dict(data['opt1'])
 
-            self.step = data['step']
-            if self.num_unet == 1:
-                self.opt0.load_state_dict(data['opt0'])
-            elif self.num_unet == 2:
-                self.opt0.load_state_dict(data['opt0'])
-                self.opt1.load_state_dict(data['opt1'])
-            self.ema.load_state_dict(data['ema'])
+        self.ema.load_state_dict(data['ema'])
 
-            if exists(self.accelerator.scaler) and exists(data['scaler']):
-                self.accelerator.scaler.load_state_dict(data['scaler'])
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
 
-            print("load model - "+str(path))
-
-        # self.ema.to(self.device)
+        print(f"Loaded model from {path}")
 
     def train(self):
         accelerator = self.accelerator
+        device = self.device
 
-        with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
-
+        with tqdm(initial=self.step, total=self.train_num_steps) as pbar:
             while self.step < self.train_num_steps:
+                total_loss = None
 
-                if self.num_unet == 1:
-                    total_loss = [0]
-                elif self.num_unet == 2:
-                    total_loss = [0, 0]
+                # 每个梯度累积步骤
                 for _ in range(self.gradient_accumulate_every):
-                    if self.condition:
-                        data = next(self.dl)
-                        data = [item.to(self.device) for item in data]
-                    else:
-                        data = next(self.dl)
-                        data = data[0] if isinstance(data, list) else data
-                        data = data.to(self.device)
+                    source_imgs, target_imgs = next(self.dl)
 
-                    with self.accelerator.autocast():
-                        loss = self.model(data)
-                        for i in range(self.num_unet):
-                            loss[i] = loss[i] / self.gradient_accumulate_every
-                            total_loss[i] = total_loss[i] + loss[i].item()
+                    # 确保数据在正确的设备上
+                    source_imgs = source_imgs.to(device)
+                    target_imgs = target_imgs.to(device)
+                    data = [source_imgs, target_imgs]
 
-                    for i in range(self.num_unet):
-                        self.accelerator.backward(loss[i])
+                    # 使用新的autocast API
+                    with torch.amp.autocast(device_type='cuda', enabled=self.accelerator.native_amp):
+                        losses = self.model(data)
 
+                        if not isinstance(losses, (list, tuple)):
+                            losses = [losses]
+
+                        if total_loss is None:
+                            total_loss = [0.0] * len(losses)
+
+                        combined_loss = None
+                        for i, loss in enumerate(losses):
+                            if loss.requires_grad:
+                                loss = loss / self.gradient_accumulate_every
+                                total_loss[i] += loss.item()
+                                if combined_loss is None:
+                                    combined_loss = loss
+                                else:
+                                    combined_loss = combined_loss + loss
+
+                        if combined_loss is not None:
+                            self.accelerator.backward(combined_loss)
+
+                    # 清理缓存
+                    torch.cuda.empty_cache()
+
+                # 梯度裁剪
                 accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
-
                 accelerator.wait_for_everyone()
 
+                # 更新优化器
                 if self.num_unet == 1:
                     self.opt0.step()
-                    self.opt0.zero_grad()
-                elif self.num_unet == 2:
+                    self.opt0.zero_grad(set_to_none=True)
+                else:
                     self.opt0.step()
-                    self.opt0.zero_grad()
+                    self.opt0.zero_grad(set_to_none=True)
                     self.opt1.step()
-                    self.opt1.zero_grad()
+                    self.opt1.zero_grad(set_to_none=True)
 
                 accelerator.wait_for_everyone()
 
+                # 更新步数和EMA
                 self.step += 1
                 if accelerator.is_main_process:
-                    self.ema.to(self.device)
+                    self.ema.to(device)
                     self.ema.update()
 
-                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                    # 保存和采样
+                    if self.step % self.save_and_sample_every == 0:
                         milestone = self.step // self.save_and_sample_every
                         self.sample(milestone)
-
-                        if self.step != 0 and self.step % (self.save_and_sample_every*10) == 0:
+                        if self.step % (self.save_and_sample_every * 10) == 0:
                             self.save(milestone)
-                            # results_folder = self.results_folder
-                            # gen_img = './results/test_timestep_10_' + \
-                            #     str(milestone)+"_pt"
-                            # self.set_results_folder(gen_img)
-                            # self.test(last=True, FID=True)
-                            # os.system(
-                            #     "python fid_and_inception_score.py "+gen_img)
-                            # self.set_results_folder(results_folder)
-                if self.num_unet == 1:
-                    pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
-                elif self.num_unet == 2:
-                    pbar.set_description(
-                        f'loss_unet0: {total_loss[0]:.4f},loss_unet1: {total_loss[1]:.4f}')
+
+                # 更新进度条
+                desc = ""
+                if len(total_loss) == 1:
+                    desc = f'loss: {total_loss[0]:.4f}'
+                else:
+                    desc = ", ".join([f'loss_{i}: {loss:.4f}' for i, loss in enumerate(total_loss)])
+
+                pbar.set_description(desc)
                 pbar.update(1)
 
-        accelerator.print('training complete')
+            print('Training complete!')
 
-    def sample(self, milestone, last=True, FID=False):
+    def sample(self, milestone):
+        """生成样本并保存"""
         self.ema.ema_model.eval()
 
         with torch.no_grad():
-            batches = self.num_samples
-            if self.condition_type == 0:
-                x_input_sample = [0]
-                show_x_input_sample = []
-            elif self.condition_type == 1:
-                x_input_sample = [next(self.sample_loader).to(self.device)]
-                show_x_input_sample = x_input_sample
-            elif self.condition_type == 2:
-                x_input_sample = next(self.sample_loader)
-                x_input_sample = [item.to(self.device)
-                                  for item in x_input_sample]
-                show_x_input_sample = x_input_sample
-                x_input_sample = x_input_sample[1:]
-            elif self.condition_type == 3:
-                x_input_sample = next(self.sample_loader)
-                x_input_sample = [item.to(self.device)
-                                  for item in x_input_sample]
-                show_x_input_sample = x_input_sample
-                x_input_sample = x_input_sample[1:]
+            # 获取一批测试数据
+            try:
+                source_imgs, target_imgs = next(self.dl)
+            except StopIteration:
+                # 如果数据加载器到达末尾，重新开始
+                self.dl = cycle(self.accelerator.prepare(self.train_dataloader))
+                source_imgs, target_imgs = next(self.dl)
 
-            all_images_list = show_x_input_sample + \
-                list(self.ema.ema_model.sample(
-                    x_input_sample, batch_size=batches, last=last))
+            # 移动到正确的设备
+            source_imgs = source_imgs.to(self.device)
+            target_imgs = target_imgs.to(self.device)
 
-            all_images = torch.cat(all_images_list, dim=0)
+            # 设置生成的样本数量
+            batch_size = min(self.num_samples, source_imgs.shape[0])
+            source_imgs = source_imgs[:batch_size]
+            target_imgs = target_imgs[:batch_size]
 
-            if last:
-                nrow = int(math.sqrt(self.num_samples))
-            else:
-                nrow = all_images.shape[0]
+            # 生成样本
+            samples = self.ema.ema_model.sample(
+                x_input=[source_imgs, target_imgs],
+                batch_size=batch_size,
+                last=True
+            )
 
-            if FID:
-                for i in range(batches):
-                    file_name = f'sample-{milestone}.png'
-                    utils.save_image(
-                        all_images_list[0][i].unsqueeze(0), os.path.join(self.results_folder, file_name), nrow=1)
-                    milestone += 1
-                    if milestone >= self.total_n_samples:
-                        break
-            else:
-                file_name = f'sample-{milestone}.png'
-                utils.save_image(all_images, str(
-                    self.results_folder / file_name), nrow=nrow)
-            print("sampe-save "+file_name)
+            # 确保samples是列表
+            if not isinstance(samples, (list, tuple)):
+                samples = [samples]
+
+            # 合并所有图像用于展示
+            all_images = []
+
+            # 添加源图像
+            all_images.append(source_imgs)
+
+            # 添加目标图像
+            all_images.append(target_imgs)
+
+            # 添加生成的图像
+            all_images.extend(samples)
+
+            # 将所有图像拼接在一起
+            all_images = torch.cat(all_images, dim=0)
+
+            # 计算网格的行数和列数
+            n_rows = len(samples) + 2  # 源图像、目标图像和生成的样本
+            n_cols = batch_size
+
+            # 保存图像
+            utils.save_image(
+                all_images,
+                str(self.results_folder / f'sample-{milestone}.png'),
+                nrow=n_cols,
+                normalize=True,
+                value_range=(-1, 1)
+            )
+            print(f"Saved samples at milestone {milestone}")
+
+        # 恢复训练模式
         self.ema.ema_model.train()
         return milestone
 
-    def test(self, sample=False, last=True, FID=False):
-        self.ema.ema_model.init()
-        self.ema.to(self.device)
-        print("test start")
-        if self.condition:
-            self.ema.ema_model.eval()
-            loader = DataLoader(
-                dataset=self.sample_dataset,
-                batch_size=1)
-            i = 0
-            for items in loader:
-                if self.condition:
-                    file_name = self.sample_dataset.load_name(
-                        i, sub_dir=self.sub_dir)
-                    file_name = f'{i}.png' if file_name==None else file_name
-                else:
-                    file_name = f'{i}.png'
-                i += 1
-
-                with torch.no_grad():
-                    batches = self.num_samples
-
-                    if self.condition_type == 0:
-                        x_input_sample = [0]
-                        show_x_input_sample = []
-                    elif self.condition_type == 1:
-                        x_input_sample = [items.to(self.device)]
-                        show_x_input_sample = x_input_sample
-                    elif self.condition_type == 2:
-                        x_input_sample = [item.to(self.device)
-                                          for item in items]
-                        show_x_input_sample = x_input_sample
-                        x_input_sample = x_input_sample[1:]
-                    elif self.condition_type == 3:
-                        x_input_sample = [item.to(self.device)
-                                          for item in items]
-                        show_x_input_sample = x_input_sample
-                        x_input_sample = x_input_sample[1:]
-
-                    if sample:
-                        all_images_list = show_x_input_sample + \
-                            list(self.ema.ema_model.sample(
-                                x_input_sample, batch_size=batches))
-                    else:
-                        all_images_list = list(self.ema.ema_model.sample(
-                            x_input_sample, batch_size=batches, last=last))
-                        all_images_list = [all_images_list[-1]]
-                        if self.crop_patch:
-                            k = 0
-                            for img in all_images_list:
-                                pad_size = self.sample_dataset.get_pad_size(i)
-                                _, _, h, w = img.shape
-                                img = img[:, :, 0:h -
-                                          pad_size[0], 0:w-pad_size[1]]
-                                all_images_list[k] = img
-                                k += 1
-
-                all_images = torch.cat(all_images_list, dim=0)
-
-                if last:
-                    nrow = int(math.sqrt(self.num_samples))
-                else:
-                    nrow = all_images.shape[0]
-
-                utils.save_image(all_images, str(
-                    self.results_folder / file_name), nrow=nrow)
-                print("test-save "+file_name)
-        else:
-            if FID:
-                self.total_n_samples = 50000
-                img_id = len(glob.glob(f"{self.results_folder}/*"))
-                n_rounds = (self.total_n_samples -
-                            img_id) // self.num_samples+1
-            else:
-                n_rounds = 100
-            for i in range(n_rounds):
-                if FID:
-                    i = img_id
-                img_id = self.sample(i, last=last, FID=FID)
-        print("test end")
-
     def set_results_folder(self, path):
+        """设置结果保存目录"""
         self.results_folder = Path(path)
-        if not self.results_folder.exists():
-            os.makedirs(self.results_folder)
+        self.results_folder.mkdir(parents=True, exist_ok=True)
